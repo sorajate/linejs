@@ -18,6 +18,7 @@ interface GroupKey {
 
 export class E2EE {
 	readonly client: BaseClient;
+	private loginKey?: { keyId: number | string; privKey: Buffer };
 	constructor(client: BaseClient) {
 		this.client = client;
 	}
@@ -33,6 +34,13 @@ export class E2EE {
 		keyId: number | string,
 		privKey: Buffer,
 	): Promise<boolean> {
+		return (await this.checkStoredKeyAgainstServer(keyId, privKey)) === true;
+	}
+
+	private async checkStoredKeyAgainstServer(
+		keyId: number | string,
+		privKey: Buffer,
+	): Promise<boolean | undefined> {
 		try {
 			const registeredKeys = await this.client.talk.getE2EEPublicKeys();
 			for (const key of registeredKeys) {
@@ -49,7 +57,25 @@ export class E2EE {
 		} catch (_e) {
 			this.e2eeLog("verifyStoredKeyAgainstServerFailed", _e);
 		}
-		return true;
+		// An unavailable/missing server key is not evidence of a match.
+		return undefined;
+	}
+
+	/** Run only after login has installed the token. Never rotate keys on failure. */
+	public async verifyLoginKey(): Promise<void> {
+		const key = this.loginKey;
+		if (!key) return;
+		const verified = await this.checkStoredKeyAgainstServer(
+			key.keyId,
+			key.privKey,
+		);
+		if (verified === false) {
+			throw new InternalError(
+				"E2EEKeyMismatch",
+				"Login key does not match the server-registered public key; no replacement key was registered",
+			);
+		}
+		this.loginKey = undefined;
 	}
 
 	public async getE2EESelfKeyData(mid: string): Promise<LooseType> {
@@ -57,7 +83,14 @@ export class E2EE {
 			const keyData = JSON.parse(
 				await this.client.storage.get("e2eeKeys:" + mid) as string,
 			);
-			if (keyData && keyData.privKey && keyData.pubKey) return keyData;
+			if (keyData && keyData.privKey && keyData.pubKey) {
+				// A new QR login can repair an old mislabelled key without deleting storage.
+				const refreshed = keyData.keyId === undefined
+					? undefined
+					: await this.getE2EESelfKeyDataByKeyId(keyData.keyId);
+				if (refreshed?.privKey && refreshed?.pubKey) return refreshed;
+				return keyData;
+			}
 		} catch (_e) {
 			/* Do Nothing */
 		}
@@ -145,25 +178,58 @@ export class E2EE {
 			}
 			return Buffer.from(key, "base64");
 		} else {
-			let key: string | undefined;
-			key = (await this.client.storage.get(
-				`e2eeGroupKeys:${mid}`,
-			)) as string;
-			if (keyId && key) {
-				const keyData = JSON.parse(key);
-				if (keyId !== keyData["keyId"]) {
-					this.e2eeLog("getE2EELocalPublicKeykeyIdMismatch", mid);
-					key = undefined;
-				} else {
-					return keyData;
-				}
-			} else {
-				key = undefined;
+			// `keyId` is the groupKeyId taken from the message envelope; the
+			// signature also allows the string form, so normalise it once.
+			let requestedKeyId = keyId === undefined ? undefined : Number(keyId);
+			if (
+				requestedKeyId !== undefined &&
+				!Number.isFinite(requestedKeyId)
+			) {
+				// A key id that is not a number names no generation, and
+				// passing it on would put NaN on the wire; ask for the current
+				// key instead, which is what happened before key ids were used
+				// to pick the generation.
+				this.e2eeLog("getE2EELocalPublicKeyInvalidGroupKeyId", mid);
+				requestedKeyId = undefined;
 			}
-			if (!key) {
-				let e2eeGroupSharedKey:
-					| LINETypes.Pb1_U3
-					| undefined;
+			const cached = await this.getCachedE2EEGroupKey(
+				mid,
+				requestedKeyId,
+			);
+			if (cached) {
+				return cached;
+			}
+			let e2eeGroupSharedKey: LINETypes.Pb1_U3 | undefined;
+			if (requestedKeyId !== undefined) {
+				// LINE rotates a group's shared key whenever the membership
+				// changes, so a message must be decrypted with the generation
+				// it was encrypted under. Asking for the last key here decrypts
+				// every older message with the wrong key and the GCM tag check
+				// fails ("unable to authenticate data") for the whole group.
+				try {
+					e2eeGroupSharedKey = await this.client.talk
+						.getE2EEGroupSharedKey({
+							keyVersion: 2,
+							chatMid: mid,
+							groupKeyId: requestedKeyId,
+						});
+				} catch (error) {
+					if (
+						error instanceof InternalError &&
+						error.data.code == "NOT_FOUND"
+					) {
+						// The server no longer serves that generation; the last
+						// key is still the best guess, as it was before.
+						this.e2eeLog(
+							"getE2EELocalPublicKeyGroupKeyIdNotFound",
+							mid,
+						);
+					} else {
+						throw error;
+					}
+				}
+			}
+			if (!e2eeGroupSharedKey) {
 				try {
 					e2eeGroupSharedKey = await this.client.talk
 						.getLastE2EEGroupSharedKey({
@@ -182,63 +248,110 @@ export class E2EE {
 						throw error;
 					}
 				}
-				const groupKeyId = e2eeGroupSharedKey.groupKeyId;
-				const creator = e2eeGroupSharedKey.creator;
-				const creatorKeyId = e2eeGroupSharedKey.creatorKeyId;
-				const receiverKeyId = e2eeGroupSharedKey.receiverKeyId;
-				const encryptedSharedKey = Buffer.from(
-					e2eeGroupSharedKey.encryptedSharedKey,
-				);
-				const selfKey = Buffer.from(
-					(await this.getE2EESelfKeyDataByKeyId(
-						receiverKeyId,
-					))["privKey"],
-					"base64",
-				);
-				const creatorKey = await this.getE2EELocalPublicKey(
-					creator,
-					creatorKeyId,
-				);
-
-				const aesKey = this.generateSharedSecret(
-					selfKey,
-					creatorKey as Buffer,
-				);
-				const aes_key = this.getSHA256Sum(Buffer.from(aesKey), "Key");
-				const aes_iv = this.xor(
-					this.getSHA256Sum(Buffer.from(aesKey), "IV"),
-				);
-
-				this.e2eeLog("getE2EELocalPublicKeyAESInfo", {
-					aes_key,
-					aes_iv,
-					encryptedSharedKey,
-				});
-				const decipher = crypto.createDecipheriv(
-					"aes-256-cbc",
-					aes_key,
-					aes_iv,
-				);
-				const plainText = Buffer.concat([
-					decipher.update(encryptedSharedKey),
-					decipher.final(),
-				]);
-				this.e2eeLog(
-					"getE2EELocalPublicKeyDecryptedLength",
-					plainText.length,
-				);
-				const decrypted = plainText.toString("base64");
-				this.e2eeLog("getE2EELocalPublicKeyDecrypted", decrypted);
-				const data = {
-					privKey: decrypted,
-					keyId: groupKeyId,
-				};
-				key = JSON.stringify(data);
-				await this.client.storage.set(`e2eeGroupKeys:${mid}`, key);
-				return data;
 			}
-			return JSON.parse(key);
+			return await this.unwrapE2EEGroupSharedKey(mid, e2eeGroupSharedKey);
 		}
+	}
+
+	private async getCachedE2EEGroupKey(
+		mid: string,
+		keyId: number | undefined,
+	): Promise<GroupKey | undefined> {
+		// Without a requested generation the caller wants whatever key is
+		// current, and only the server knows that.
+		if (keyId === undefined) {
+			return undefined;
+		}
+		// `e2eeGroupKeys:${mid}` held a single key per group, so two
+		// generations of a rotated key kept evicting each other and every
+		// lookup went back to the server for the wrong one. The per-keyId slot
+		// is the real cache; the unsuffixed one is read for storages written
+		// by earlier versions.
+		for (
+			const cacheKey of [
+				`e2eeGroupKeys:${mid}:${keyId}`,
+				`e2eeGroupKeys:${mid}`,
+			]
+		) {
+			const cached = (await this.client.storage.get(cacheKey)) as string;
+			if (!cached) {
+				continue;
+			}
+			const groupKey = JSON.parse(cached) as GroupKey;
+			if (Number(groupKey.keyId) === keyId) {
+				return groupKey;
+			}
+			this.e2eeLog("getE2EELocalPublicKeykeyIdMismatch", mid);
+		}
+		return undefined;
+	}
+
+	/** ECDH against the key creator's public key, then AES-256-CBC over the
+	 *  wrapped shared key — the same for a keyed and for a last-key fetch. */
+	private async unwrapE2EEGroupSharedKey(
+		mid: string,
+		e2eeGroupSharedKey: LINETypes.Pb1_U3,
+	): Promise<GroupKey> {
+		const groupKeyId = e2eeGroupSharedKey.groupKeyId;
+		const creator = e2eeGroupSharedKey.creator;
+		const creatorKeyId = e2eeGroupSharedKey.creatorKeyId;
+		const receiverKeyId = e2eeGroupSharedKey.receiverKeyId;
+		const encryptedSharedKey = Buffer.from(
+			e2eeGroupSharedKey.encryptedSharedKey,
+		);
+		const selfKey = Buffer.from(
+			(await this.getE2EESelfKeyDataByKeyId(
+				receiverKeyId,
+			))["privKey"],
+			"base64",
+		);
+		const creatorKey = await this.getE2EELocalPublicKey(
+			creator,
+			creatorKeyId,
+		);
+
+		const aesKey = this.generateSharedSecret(
+			selfKey,
+			creatorKey as Buffer,
+		);
+		const aes_key = this.getSHA256Sum(Buffer.from(aesKey), "Key");
+		const aes_iv = this.xor(
+			this.getSHA256Sum(Buffer.from(aesKey), "IV"),
+		);
+
+		this.e2eeLog("getE2EELocalPublicKeyAESInfo", {
+			aes_key,
+			aes_iv,
+			encryptedSharedKey,
+		});
+		const decipher = crypto.createDecipheriv(
+			"aes-256-cbc",
+			aes_key,
+			aes_iv,
+		);
+		const plainText = Buffer.concat([
+			decipher.update(encryptedSharedKey),
+			decipher.final(),
+		]);
+		this.e2eeLog(
+			"getE2EELocalPublicKeyDecryptedLength",
+			plainText.length,
+		);
+		const decrypted = plainText.toString("base64");
+		this.e2eeLog("getE2EELocalPublicKeyDecrypted", decrypted);
+		const data: GroupKey = {
+			privKey: decrypted,
+			keyId: groupKeyId,
+		};
+		const key = JSON.stringify(data);
+		await this.client.storage.set(
+			`e2eeGroupKeys:${mid}:${groupKeyId}`,
+			key,
+		);
+		// Consumers that predate the per-keyId slot only know the unsuffixed
+		// one, so keep it pointing at the key used most recently.
+		await this.client.storage.set(`e2eeGroupKeys:${mid}`, key);
+		return data;
 	}
 	public async tryRegisterE2EEGroupKey(
 		chatMid: string,
@@ -358,58 +471,33 @@ export class E2EE {
 			const keyId = data.keyId;
 			const publicKey = Buffer.from(data.publicKey, "base64");
 			const e2eeVersion = data.e2eeVersion;
-			const [privKey, pubKey] = this.decryptKeyChain(
+			const keys = this.decryptKeyChainEntries(
 				publicKey,
 				secret,
 				encryptedKeyChain,
 			);
-			this.e2eeLog("decodeE2EEKeyV1E2EEKeyInfo", {
-				e2eeKey: {
-					keyId,
-					privKey,
-					pubKey,
-					e2eeVersion,
-				},
-			});
-			const derivedPub = Buffer.from(
-				nacl.scalarMult.base(new Uint8Array(privKey)),
-			);
-			if (!derivedPub.equals(pubKey)) {
-				this.e2eeLog("decodeE2EEKeyV1KeyMismatch", {
-					keyId,
-					derivedPub: derivedPub.toString("base64"),
-					chainPub: pubKey.toString("base64"),
-				});
-				this.client.emit(
-					"e2ee:keyMismatch" as LooseType,
-					{ keyId, reason: "privKey does not derive to pubKey in chain" },
+			const selected = keys.find((key) => String(key.keyId) === String(keyId));
+			if (!selected) {
+				throw new InternalError(
+					"NoE2EEKey",
+					"Requested keyId is absent from the login keychain",
 				);
-				return undefined;
 			}
-			const verified = await this.verifyStoredKeyAgainstServer(
-				keyId,
-				privKey,
-			);
-			if (!verified) {
-				this.e2eeLog("decodeE2EEKeyV1ServerKeyMismatch", {
-					keyId,
-					derivedPub: derivedPub.toString("base64"),
-				});
-				this.client.emit(
-					"e2ee:keyMismatch" as LooseType,
-					{ keyId, reason: "privKey does not match server-registered pubKey" },
+			const { privKey, pubKey } = selected;
+			// Server verification is deferred until the login token is installed.
+			this.loginKey = { keyId, privKey };
+			// Keep historical generations under their own IDs, never the selected ID.
+			for (const key of keys) {
+				await this.client.storage.set(
+					"e2eeKeys:" + key.keyId,
+					JSON.stringify({
+						keyId: key.keyId,
+						privKey: key.privKey.toString("base64"),
+						pubKey: key.pubKey.toString("base64"),
+						e2eeVersion,
+					}),
 				);
-				return undefined;
 			}
-			await this.client.storage.set(
-				"e2eeKeys:" + keyId,
-				JSON.stringify({
-					keyId,
-					privKey: privKey.toString("base64"),
-					pubKey: pubKey.toString("base64"),
-					e2eeVersion,
-				}),
-			);
 			return {
 				keyId,
 				privKey,
@@ -422,14 +510,30 @@ export class E2EE {
 		publicKey: Buffer,
 		privateKey: Buffer,
 		encryptedKeyChain: Buffer,
+		keyId?: number | string,
 	): Buffer[] {
-		this.e2eeLog("decryptKeyChainKeyInfo", {
-			decryptKeyChain: {
-				publicKey: publicKey.toString("base64"),
-				privateKey: privateKey.toString("base64"),
-				encryptedKeyChain: encryptedKeyChain.toString("base64"),
-			},
-		});
+		const keys = this.decryptKeyChainEntries(
+			publicKey,
+			privateKey,
+			encryptedKeyChain,
+		);
+		const selected = keyId === undefined
+			? (keys.length === 1 ? keys[0] : undefined)
+			: keys.find((key) => String(key.keyId) === String(keyId));
+		if (!selected) {
+			throw new InternalError(
+				"NoE2EEKey",
+				"A matching keyId is required for the login keychain",
+			);
+		}
+		return [selected.privKey, selected.pubKey];
+	}
+
+	private decryptKeyChainEntries(
+		publicKey: Buffer,
+		privateKey: Buffer,
+		encryptedKeyChain: Buffer,
+	): Array<{ keyId: number; privKey: Buffer; pubKey: Buffer }> {
 		const sharedSecret = this.generateSharedSecret(privateKey, publicKey);
 		const aesKey = this.getSHA256Sum(Buffer.from(sharedSecret), "Key");
 		const aesIv = this.xor(
@@ -441,13 +545,36 @@ export class E2EE {
 			decipher.update(encryptedKeyChain),
 			decipher.final(),
 		]);
-		this.e2eeLog("decryptKeyChainBinKeyInfo", {
-			binkey: keychainData.toString("hex"),
+		const entries = this.client.thrift.readThriftStruct(keychainData)[1];
+		if (!Array.isArray(entries) || entries.length === 0) {
+			throw new InternalError(
+				"NoE2EEKey",
+				"Login keychain is empty or malformed",
+			);
+		}
+		const seen = new Set<number>();
+		return entries.map((entry) => {
+			const keyId = entry[2];
+			if (!Number.isInteger(keyId) || seen.has(keyId)) {
+				throw new InternalError(
+					"NoE2EEKey",
+					"Login keychain contains an invalid or duplicate keyId",
+				);
+			}
+			seen.add(keyId);
+			const pubKey = Buffer.from(entry[4]);
+			const privKey = Buffer.from(entry[5]);
+			if (
+				privKey.length !== 32 || pubKey.length !== 32 ||
+				!this.verifyE2EEKeyPair(privKey, pubKey)
+			) {
+				throw new InternalError(
+					"NoE2EEKey",
+					"Login keychain contains an invalid key pair",
+				);
+			}
+			return { keyId, privKey, pubKey };
 		});
-		const key = this.client.thrift.readThriftStruct(keychainData)[1];
-		const publicKeyBytes = Buffer.from(key[0][4]);
-		const privateKeyBytes = Buffer.from(key[0][5]);
-		return [privateKeyBytes, publicKeyBytes];
 	}
 
 	public encryptDeviceSecret(
