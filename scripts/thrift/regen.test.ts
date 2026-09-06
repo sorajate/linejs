@@ -28,6 +28,7 @@ const linejsRoot = fromFileUrl(import.meta.resolve("../../"));
  *  the repo root so `deno fmt` picks up the same deno.json the real run uses. */
 async function denoFmt(paths: string[]): Promise<void> {
 	const cmd = new Deno.Command(Deno.execPath(), {
+		cwd: linejsRoot,
 		args: ["fmt", ...paths],
 		stdout: "null",
 		stderr: "piped",
